@@ -1,0 +1,232 @@
+name: Claude PR Review & Security Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+  statuses: write
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    steps:
+
+      # 1. Checkout the PR branch
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 2. Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      # 3. Install dependencies
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-json-report
+
+      # 4. Run Test Cases & capture results
+      #    - pytest-json-report writes results to .report.json
+      #    - The step always exits 0 so later steps still run,
+      #      but we record whether tests actually executed.
+      - name: Run Tests
+        id: run_tests
+        run: |
+          pytest --json-report --json-report-file=test-results.json -v 2>&1 | tee pytest-output.txt
+          if [ $? -eq 0 ]; then
+            echo "tests_ran=true"  >> $GITHUB_OUTPUT
+            echo "tests_passed=true"  >> $GITHUB_OUTPUT
+          else
+            echo "tests_ran=true"  >> $GITHUB_OUTPUT
+            echo "tests_passed=false" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      # Fail-safe: mark tests as NOT run if the results file is missing
+      - name: Verify Test Results Exist
+        id: verify_tests
+        run: |
+          if [ ! -f test-results.json ]; then
+            echo '{"summary":{"passed":0,"failed":0,"error":1},"tests":[]}' > test-results.json
+            echo "tests_ran=false" >> $GITHUB_OUTPUT
+          else
+            echo "tests_ran=true" >> $GITHUB_OUTPUT
+          fi
+
+      # 5. Get the PR diff
+      - name: Get PR Diff
+        id: get_diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > pr_diff.txt
+
+      # 6. Send to Claude for Code Review + Security Analysis
+      - name: Claude Code Review & Security Scan
+        id: claude_review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          DIFF=$(cat pr_diff.txt | head -c 15000)
+          TEST_RESULTS=$(cat test-results.json | head -c 5000)
+          TESTS_RAN="${{ steps.verify_tests.outputs.tests_ran }}"
+
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "$(jq -n \
+              --arg diff "$DIFF" \
+              --arg tests "$TEST_RESULTS" \
+              --arg tests_ran "$TESTS_RAN" \
+              '{
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 2000,
+                messages: [{
+                  role: "user",
+                  content: ("You are a senior security engineer and code reviewer reviewing a Python pull request.\n\nAnalyze the code diff and pytest JSON results provided below.\n\nRespond ONLY in this exact JSON format with no extra text or markdown:\n{\n  \"security_findings\": [\n    {\"severity\": \"Critical|High|Medium|Low|Info\", \"title\": \"...\", \"description\": \"...\", \"file\": \"...\", \"line\": \"...\"}\n  ],\n  \"code_review\": {\n    \"summary\": \"...\",\n    \"issues\": [\"...\"],\n    \"suggestions\": [\"...\"]\n  },\n  \"test_analysis\": {\n    \"tests_ran\": true,\n    \"passed\": true,\n    \"total\": 0,\n    \"passed_count\": 0,\n    \"failed_count\": 0,\n    \"summary\": \"...\",\n    \"failed_tests\": [\"...\"]\n  },\n  \"merge_recommendation\": {\n    \"allowed\": true,\n    \"reason\": \"...\",\n    \"blocking_reasons\": [\"...\"]\n  }\n}\n\nBLOCKING RULES — set allowed=false and list reasons in blocking_reasons if ANY of these are true:\n1. security_findings contains any item with severity Critical, High, or Medium\n2. tests_ran is false (tests did not execute at all)\n3. test_analysis.passed is false (one or more tests failed)\n\nPython-specific security checks to perform:\n- SQL injection via string formatting or % operator in queries\n- Use of eval(), exec(), pickle.loads() on untrusted input\n- Hardcoded secrets, passwords, or API keys\n- Insecure use of subprocess with shell=True\n- Path traversal vulnerabilities\n- Insecure deserialization\n- Missing input validation on user-controlled data\n- Use of outdated/vulnerable functions (e.g. md5 for passwords)\n- Unhandled exceptions that expose stack traces\n\ntests_ran flag: " + $tests_ran + "\n\nPR DIFF:\n" + $diff + "\n\nPYTEST JSON RESULTS:\n" + $tests)
+                }]
+              }')")
+
+          echo "$RESPONSE" > claude_response.json
+
+          # Extract JSON text block from Claude response
+          REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text')
+          echo "$REVIEW" > review.json
+
+          # Parse merge recommendation
+          ALLOWED=$(echo "$REVIEW" | jq -r '.merge_recommendation.allowed')
+          REASON=$(echo "$REVIEW" | jq -r '.merge_recommendation.reason')
+
+          echo "allowed=$ALLOWED"   >> $GITHUB_OUTPUT
+          echo "reason=$REASON"     >> $GITHUB_OUTPUT
+
+      # 7. Post Claude's full review as a PR comment
+      - name: Post Review Comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const review = JSON.parse(fs.readFileSync('review.json', 'utf8'));
+
+            const sev = { Critical: '🔴', High: '🟠', Medium: '🟡', Low: '🔵', Info: '⚪' };
+            const allowed = review.merge_recommendation.allowed;
+
+            // ── Security Findings ──────────────────────────────────────
+            let secSection = '### 🔒 Security Findings\n';
+            if (!review.security_findings || review.security_findings.length === 0) {
+              secSection += '✅ No security issues found.\n';
+            } else {
+              secSection += '| Severity | Title | File | Description |\n|---|---|---|---|\n';
+              for (const f of review.security_findings) {
+                const icon = sev[f.severity] || '';
+                secSection += `| ${icon} **${f.severity}** | ${f.title} | \`${f.file || 'N/A'}:${f.line || '?'}\` | ${f.description} |\n`;
+              }
+            }
+
+            // Blocking reasons list
+            const blocking = review.merge_recommendation.blocking_reasons?.filter(r => r && r !== '...') || [];
+            const blockSection = blocking.length
+              ? `\n> ⛔ **Blocking Reasons:**\n${blocking.map(r => `> - ${r}`).join('\n')}\n`
+              : '';
+
+            // ── Test Results ───────────────────────────────────────────
+            const t = review.test_analysis;
+            let testSection = '### 🧪 Pytest Results\n';
+            if (!t.tests_ran) {
+              testSection += '❌ **Tests did not run.** Merge is blocked until tests execute successfully.\n';
+            } else {
+              testSection += `${t.passed ? '✅ All tests passed' : '❌ Some tests failed'} — `;
+              testSection += `**${t.passed_count}/${t.total} passed**\n\n${t.summary}\n`;
+              if (t.failed_tests?.filter(x => x && x !== '...').length) {
+                testSection += `\n**Failed tests:**\n${t.failed_tests.filter(x => x && x !== '...').map(x => `- \`${x}\``).join('\n')}\n`;
+              }
+            }
+
+            // ── Code Review ────────────────────────────────────────────
+            const cr = review.code_review;
+            let reviewSection = `### 📝 Code Review\n${cr.summary}\n`;
+            const issues = cr.issues?.filter(i => i && i !== '...') || [];
+            const suggestions = cr.suggestions?.filter(s => s && s !== '...') || [];
+            if (issues.length)      reviewSection += `\n**Issues:**\n${issues.map(i => `- ${i}`).join('\n')}\n`;
+            if (suggestions.length) reviewSection += `\n**Suggestions:**\n${suggestions.map(s => `- ${s}`).join('\n')}\n`;
+
+            // ── Verdict Banner ─────────────────────────────────────────
+            const verdict = allowed
+              ? '## ✅ MERGE ALLOWED — Ready for Manual Review & Merge'
+              : '## ❌ MERGE BLOCKED — Address All Issues Before Merging';
+
+            const body = [
+              '# 🤖 Claude AI PR Review',
+              '',
+              verdict,
+              `**Summary:** ${review.merge_recommendation.reason}`,
+              blockSection,
+              '---',
+              secSection,
+              '---',
+              testSection,
+              '---',
+              reviewSection,
+              '---',
+              allowed
+                ? '_✅ This PR has passed all automated checks. A team member may now merge it manually._'
+                : '_❌ Merging is blocked via branch protection. Fix all Critical/High/Medium findings and ensure all tests pass before re-requesting review._'
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body
+            });
+
+      # 8. Set a commit status — this is what branch protection rules enforce
+      #    ALLOWED  → status: success  → manual merge is permitted
+      #    BLOCKED  → status: failure  → GitHub prevents the merge button
+      - name: Set Commit Status (Enforce Merge Gate)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const allowed = '${{ steps.claude_review.outputs.allowed }}' === 'true';
+            const reason  = `${{ steps.claude_review.outputs.reason }}`;
+            const sha     = context.payload.pull_request.head.sha;
+
+            await github.rest.repos.createCommitStatus({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              sha:         sha,
+              state:       allowed ? 'success' : 'failure',
+              context:     'claude-pr-review',
+              description: reason.substring(0, 140),
+              target_url:  `https://github.com/${context.repo.owner}/${context.repo.repo}/pull/${context.payload.pull_request.number}`
+            });
+
+      # 9. Also post a formal PR review (approve or request changes)
+      - name: Post PR Review Decision
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const allowed = '${{ steps.claude_review.outputs.allowed }}' === 'true';
+            const pr = context.payload.pull_request.number;
+
+            await github.rest.pulls.createReview({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              pull_number: pr,
+              event:       allowed ? 'APPROVE' : 'REQUEST_CHANGES',
+              body:        allowed
+                ? '✅ Claude AI found no blocking issues. This PR is cleared for manual merge by a team member.'
+                : '❌ Claude AI has blocked this PR. Resolve all Critical, High, and Medium security findings and ensure all pytest cases pass.'
+            });
