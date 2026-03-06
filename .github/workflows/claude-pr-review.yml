@@ -216,20 +216,20 @@ jobs:
             });
 
       # 9. Also post a formal PR review (approve or request changes)
-      - name: Post PR Review Decision
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.APPROVE_TOKEN }}
-          script: |
-            const allowed = '${{ steps.claude_review.outputs.allowed }}' === 'true';
-            const pr = context.payload.pull_request.number;
+      # - name: Post PR Review Decision
+      #   uses: actions/github-script@v7
+      #   with:
+      #     github-token: ${{ secrets.APPROVE_TOKEN }}
+      #     script: |
+      #       const allowed = '${{ steps.claude_review.outputs.allowed }}' === 'true';
+      #       const pr = context.payload.pull_request.number;
 
-            await github.rest.pulls.createReview({
-              owner:       context.repo.owner,
-              repo:        context.repo.repo,
-              pull_number: pr,
-              event:       allowed ? 'APPROVE' : 'REQUEST_CHANGES',
-              body:        allowed
-                ? '✅ Claude AI found no blocking issues. This PR is cleared for manual merge by a team member.'
-                : '❌ Claude AI has blocked this PR. Resolve all Critical, High, and Medium security findings and ensure all pytest cases pass.'
-            });
+      #       await github.rest.pulls.createReview({
+      #         owner:       context.repo.owner,
+      #         repo:        context.repo.repo,
+      #         pull_number: pr,
+      #         event:       allowed ? 'APPROVE' : 'REQUEST_CHANGES',
+      #         body:        allowed
+      #           ? '✅ Claude AI found no blocking issues. This PR is cleared for manual merge by a team member.'
+      #           : '❌ Claude AI has blocked this PR. Resolve all Critical, High, and Medium security findings and ensure all pytest cases pass.'
+      #       });
