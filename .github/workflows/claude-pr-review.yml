@@ -140,17 +140,17 @@ jobs:
               : '';
 
             // ── Test Results ───────────────────────────────────────────
-            //const t = review.test_analysis;
-            //let testSection = '### 🧪 Pytest Results\n';
-            //if (!t.tests_ran) {
-            //  testSection += '❌ **Tests did not run.** Merge is blocked until tests execute successfully.\n';
-            //} else {
-            //  testSection += `${t.passed ? '✅ All tests passed' : '❌ Some tests failed'} — `;
-            //  testSection += `**${t.passed_count}/${t.total} passed**\n\n${t.summary}\n`;
-            //  if (t.failed_tests?.filter(x => x && x !== '...').length) {
-            //    testSection += `\n**Failed tests:**\n${t.failed_tests.filter(x => x && x !== '...').map(x => `- \`${x}\``).join('\n')}\n`;
-            //  }
-            //}
+            const t = review.test_analysis;
+            let testSection = '### 🧪 Pytest Results\n';
+            if (!t.tests_ran) {
+              testSection += '❌ **Tests did not run.** Merge is blocked until tests execute successfully.\n';
+            } else {
+              testSection += `${t.passed ? '✅ All tests passed' : '❌ Some tests failed'} — `;
+              testSection += `**${t.passed_count}/${t.total} passed**\n\n${t.summary}\n`;
+              if (t.failed_tests?.filter(x => x && x !== '...').length) {
+                testSection += `\n**Failed tests:**\n${t.failed_tests.filter(x => x && x !== '...').map(x => `- \`${x}\``).join('\n')}\n`;
+              }
+            }
 
             // ── Code Review ────────────────────────────────────────────
             const cr = review.code_review;
